@@ -1,0 +1,7 @@
+/target/
+/Cargo.lock
+/uploads/
+
+.DS_Store
+
+.vscode/
