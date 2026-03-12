@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -26,12 +27,12 @@ struct AppState {
     upload_root: PathBuf,
 }
 
-#[allow(dead_code)]
 struct UploadSession {
     wark: String,
     filename: String,
     filesize: u64,
     chunk_size: u64,
+    created_at: Instant,
     received_chunks: Mutex<BitVec>,
     file_path: PathBuf,
     expected_hashes: Vec<[u8; 32]>,
@@ -79,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("listening on http://{addr}");
+    println!("server: listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -112,11 +113,19 @@ async fn upload_handshake(
     }
 
     let wark = compute_wark(request.filesize, &request.hashes);
+    println!(
+        "server: handshake filename={} size={} chunk_size={} chunks={} wark={}",
+        request.filename,
+        request.filesize,
+        request.chunk_size,
+        expected_chunks,
+        short_wark(&wark)
+    );
 
-    let session = {
+    let (session, created) = {
         let mut sessions = state.sessions.write().await;
         if let Some(existing) = sessions.get(&wark) {
-            Arc::clone(existing)
+            (Arc::clone(existing), false)
         } else {
             let session = Arc::new(
                 create_session(
@@ -130,11 +139,48 @@ async fn upload_handshake(
                 .map_err(internal_error)?,
             );
             sessions.insert(wark.clone(), Arc::clone(&session));
-            session
+            (session, true)
         }
     };
 
     let missing_chunks = session.missing_chunks().await;
+    let missing_bytes = chunk_indexes_len(session.filesize, session.chunk_size, &missing_chunks);
+    let complete_bytes = session.filesize.saturating_sub(missing_bytes);
+    if created {
+        println!(
+            "server: created session {} path={} missing={}/{} progress={} bytes={}/{}",
+            short_wark(&session.wark),
+            session.file_path.display(),
+            missing_chunks.len(),
+            session.expected_hashes.len(),
+            format_percent(complete_bytes, session.filesize),
+            format_bytes(complete_bytes),
+            format_bytes(session.filesize)
+        );
+    } else if missing_chunks.is_empty() {
+        println!(
+            "server: existing upload already complete {} filename={} progress={} bytes={}/{} avg_write_rate={}",
+            short_wark(&session.wark),
+            session.filename,
+            format_percent(complete_bytes, session.filesize),
+            format_bytes(complete_bytes),
+            format_bytes(session.filesize),
+            format_rate(complete_bytes, session.created_at.elapsed())
+        );
+    } else {
+        println!(
+            "server: resuming existing upload {} filename={} missing={}/{} progress={} bytes={}/{} avg_write_rate={}",
+            short_wark(&session.wark),
+            session.filename,
+            missing_chunks.len(),
+            session.expected_hashes.len(),
+            format_percent(complete_bytes, session.filesize),
+            format_bytes(complete_bytes),
+            format_bytes(session.filesize),
+            format_rate(complete_bytes, session.created_at.elapsed())
+        );
+    }
+
     Ok(Json(UploadSessionResponse { wark, missing_chunks }))
 }
 
@@ -184,6 +230,11 @@ async fn upload_chunk(
     {
         let received = session.received_chunks.lock().await;
         if received.get(index).map(|bit| *bit).unwrap_or(false) {
+            println!(
+                "server: dedup chunk {} ignored for {}",
+                request.index,
+                short_wark(&session.wark)
+            );
             return Ok(Json(ChunkUploadResponse {
                 stored: false,
                 duplicate: true,
@@ -199,6 +250,21 @@ async fn upload_chunk(
 
     let mut received = session.received_chunks.lock().await;
     received.set(index, true);
+    let remaining = received.iter().by_vals().filter(|present| !present).count();
+    let received_count = received.len().saturating_sub(remaining);
+    let completed_bytes = completed_bytes_from_bits(&received, session.chunk_size, session.filesize);
+    println!(
+        "server: stored chunk {} for {} ({}/{} complete, remaining={}) progress={} bytes={}/{} avg_write_rate={}",
+        request.index,
+        short_wark(&session.wark),
+        received_count,
+        received.len(),
+        remaining,
+        format_percent(completed_bytes, session.filesize),
+        format_bytes(completed_bytes),
+        format_bytes(session.filesize),
+        format_rate(completed_bytes, session.created_at.elapsed())
+    );
 
     Ok(Json(ChunkUploadResponse {
         stored: true,
@@ -219,6 +285,29 @@ async fn finalize_upload(
     };
 
     let missing_chunks = session.missing_chunks().await;
+    let missing_bytes = chunk_indexes_len(session.filesize, session.chunk_size, &missing_chunks);
+    let complete_bytes = session.filesize.saturating_sub(missing_bytes);
+    if missing_chunks.is_empty() {
+        println!(
+            "server: finalize complete for {} filename={} progress={} bytes={}/{} elapsed={} avg_write_rate={}",
+            short_wark(&session.wark),
+            session.filename,
+            format_percent(complete_bytes, session.filesize),
+            format_bytes(complete_bytes),
+            format_bytes(session.filesize),
+            format_duration(session.created_at.elapsed()),
+            format_rate(complete_bytes, session.created_at.elapsed())
+        );
+    } else {
+        println!(
+            "server: finalize incomplete for {} missing={:?} progress={} bytes={}/{}",
+            short_wark(&session.wark),
+            missing_chunks,
+            format_percent(complete_bytes, session.filesize),
+            format_bytes(complete_bytes),
+            format_bytes(session.filesize)
+        );
+    }
     Ok(Json(FinalizeResponse {
         complete: missing_chunks.is_empty(),
         missing_chunks,
@@ -239,6 +328,18 @@ async fn upload_status(
     };
 
     let missing_chunks = session.missing_chunks().await;
+    let missing_bytes = chunk_indexes_len(session.filesize, session.chunk_size, &missing_chunks);
+    let complete_bytes = session.filesize.saturating_sub(missing_bytes);
+    println!(
+        "server: status {} missing={}/{} progress={} bytes={}/{} avg_write_rate={}",
+        short_wark(&wark),
+        missing_chunks.len(),
+        session.expected_hashes.len(),
+        format_percent(complete_bytes, session.filesize),
+        format_bytes(complete_bytes),
+        format_bytes(session.filesize),
+        format_rate(complete_bytes, session.created_at.elapsed())
+    );
     Ok(Json(UploadSessionResponse { wark, missing_chunks }))
 }
 
@@ -264,6 +365,7 @@ fn create_session(
         filename: filename.to_owned(),
         filesize,
         chunk_size,
+        created_at: Instant::now(),
         received_chunks: Mutex::new(BitVec::repeat(false, expected_hashes.len())),
         file_path,
         expected_hashes,
@@ -282,6 +384,70 @@ fn safe_file_key(wark: &str) -> String {
 
 fn internal_error(error: impl std::fmt::Display) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn short_wark(wark: &str) -> &str {
+    let end = wark.len().min(12);
+    &wark[..end]
+}
+
+fn chunk_indexes_len(filesize: u64, chunk_size: u64, indexes: &[u32]) -> u64 {
+    indexes
+        .iter()
+        .filter_map(|&index| chunk_len(filesize, chunk_size, index))
+        .sum()
+}
+
+fn completed_bytes_from_bits(received: &BitVec, chunk_size: u64, filesize: u64) -> u64 {
+    received
+        .iter()
+        .by_vals()
+        .enumerate()
+        .filter_map(|(index, present)| {
+            present.then(|| chunk_len(filesize, chunk_size, index as u32)).flatten()
+        })
+        .sum()
+}
+
+fn format_percent(done: u64, total: u64) -> String {
+    if total == 0 {
+        return "100.0%".to_owned();
+    }
+
+    format!("{:.1}%", (done as f64 / total as f64) * 100.0)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs_f64() >= 1.0 {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
+fn format_rate(bytes: u64, elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if bytes == 0 || seconds <= f64::EPSILON {
+        return "n/a".to_owned();
+    }
+
+    format!("{}/s", format_bytes((bytes as f64 / seconds) as u64))
 }
 
 impl UploadSession {
