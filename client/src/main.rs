@@ -76,6 +76,7 @@ fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
             ))
             .into());
         }
+        let hash_started = Instant::now();
         let chunk_results: Vec<_> = mmap
             .par_chunks(chunk_size)
             .enumerate()
@@ -88,10 +89,7 @@ fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
             .collect();
 
         let total_chunks = chunk_results.len();
-        let total_hash_time: f64 = chunk_results
-            .iter()
-            .map(|(_, _, _, elapsed)| elapsed)
-            .sum();
+        let wall_clock_hash_time = hash_started.elapsed().as_secs_f64();
         for (index, chunk_len, _, elapsed) in &chunk_results {
             let progress = ((*index + 1) as f64 / total_chunks as f64) * 100.0;
             let throughput_mib = if *elapsed > 0.0 {
@@ -112,7 +110,7 @@ fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
             "hash total {}/{} | 100.0% | {:.6}s",
             total_chunks,
             total_chunks,
-            total_hash_time
+            wall_clock_hash_time
         );
 
         chunk_results
