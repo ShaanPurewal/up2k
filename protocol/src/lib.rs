@@ -30,6 +30,19 @@ pub struct FinalizeUpload {
     pub wark: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChunkUploadProgress {
+    pub wark: String,
+    pub index: u32,
+    pub uploaded_chunks: u32,
+    pub total_chunks: u32,
+    pub uploaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percent_complete: f64,
+    pub throughput_bytes_per_sec: f64,
+    pub eta_seconds: f64,
+}
+
 // Chunk Hashing
 pub fn compute_chunk_size(filesize: u64) -> u64 {
     const MIB: u64 = 1 << 20;

@@ -4,6 +4,7 @@ use std::{
     io::{self, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use axum::{
@@ -11,12 +12,12 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post},
 };
 use bitvec::{bitvec, prelude::BitVec};
 use protocol::{
-    ChunkHash, FinalizeUpload, UploadHandshake, UploadSessionResponse, compute_wark, hash_chunk,
+    ChunkHash, ChunkUploadProgress, FinalizeUpload, UploadHandshake, UploadSessionResponse,
+    compute_wark, hash_chunk,
 };
 use serde::Deserialize;
 
@@ -36,6 +37,9 @@ struct UploadSession {
     hashes: Vec<ChunkHash>,
     received: BitVec,
     file_path: PathBuf,
+    started_at: Instant,
+    uploaded_bytes: u64,
+    uploaded_chunks: u32,
 }
 
 #[derive(Debug, Default)]
@@ -91,6 +95,41 @@ fn missing_chunks(received: &BitVec) -> Vec<u32> {
         .enumerate()
         .filter_map(|(index, done)| (!done).then_some(index as u32))
         .collect()
+}
+
+fn chunk_progress(session: &UploadSession, index: u32) -> ChunkUploadProgress {
+    let total_chunks = chunk_count(session.filesize, session.chunk_size);
+    let elapsed_secs = session.started_at.elapsed().as_secs_f64();
+    let percent_complete = if session.filesize == 0 {
+        100.0
+    } else {
+        (session.uploaded_bytes as f64 / session.filesize as f64) * 100.0
+    };
+    let throughput_bytes_per_sec = if elapsed_secs > 0.0 {
+        session.uploaded_bytes as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    let remaining_bytes = session.filesize.saturating_sub(session.uploaded_bytes);
+    let eta_seconds = if remaining_bytes == 0 {
+        0.0
+    } else if throughput_bytes_per_sec > 0.0 {
+        remaining_bytes as f64 / throughput_bytes_per_sec
+    } else {
+        0.0
+    };
+
+    ChunkUploadProgress {
+        wark: session.wark.clone(),
+        index,
+        uploaded_chunks: session.uploaded_chunks,
+        total_chunks,
+        uploaded_bytes: session.uploaded_bytes,
+        total_bytes: session.filesize,
+        percent_complete,
+        throughput_bytes_per_sec,
+        eta_seconds,
+    }
 }
 
 async fn upload_handshake(
@@ -150,6 +189,9 @@ async fn upload_handshake(
         hashes: req.hashes,
         received: bitvec![0; expected_chunks],
         file_path,
+        started_at: Instant::now(),
+        uploaded_bytes: 0,
+        uploaded_chunks: 0,
     };
 
     let mut state = state.lock().map_err(|_| {
@@ -179,7 +221,7 @@ async fn upload_chunk(
     State(state): State<SharedState>,
     Query(query): Query<ChunkQuery>,
     body: Bytes,
-) -> HandlerResult<impl IntoResponse> {
+) -> HandlerResult<Json<ChunkUploadProgress>> {
     let (file_path, chunk_size, filesize, expected_hash) = {
         let state = state.lock().map_err(|_| {
             (
@@ -198,7 +240,7 @@ async fn upload_chunk(
         }
 
         if session.received[query.index as usize] {
-            return Ok(StatusCode::OK);
+            return Ok(Json(chunk_progress(session, query.index)));
         }
 
         (
@@ -244,9 +286,13 @@ async fn upload_chunk(
         .sessions
         .get_mut(&query.wark)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown wark".to_owned()))?;
-    session.received.set(query.index as usize, true);
+    if !session.received[query.index as usize] {
+        session.received.set(query.index as usize, true);
+        session.uploaded_bytes = session.uploaded_bytes.saturating_add(expected_size);
+        session.uploaded_chunks = session.uploaded_chunks.saturating_add(1);
+    }
 
-    Ok(StatusCode::OK)
+    Ok(Json(chunk_progress(session, query.index)))
 }
 
 async fn finalize_upload(

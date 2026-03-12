@@ -8,8 +8,8 @@ use std::{
 
 use memmap2::{Mmap, MmapOptions};
 use protocol::{
-    FinalizeUpload, UploadHandshake, UploadSessionResponse, compute_chunk_size, compute_wark,
-    hash_chunk,
+    ChunkUploadProgress, FinalizeUpload, UploadHandshake, UploadSessionResponse,
+    compute_chunk_size, compute_wark, hash_chunk,
 };
 use rayon::prelude::*;
 use reqwest::Client;
@@ -95,7 +95,7 @@ async fn upload_chunk(
     wark: &str,
     mmap: &Mmap,
     index: u32,
-) -> Result<()> {
+) -> Result<ChunkUploadProgress> {
     let chunk_count = u32::try_from(handshake.hashes.len())
         .map_err(|_| io::Error::other("chunk count exceeds u32"))?;
     if index >= chunk_count {
@@ -113,7 +113,7 @@ async fn upload_chunk(
     let chunk = &mmap[start..end];
     let index_text = index.to_string();
 
-    client
+    let response = client
         .post(endpoint("/upload/chunk"))
         .query(&[("wark", wark), ("index", index_text.as_str())])
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -122,7 +122,7 @@ async fn upload_chunk(
         .await?
         .error_for_status()?;
 
-    Ok(())
+    Ok(response.json::<ChunkUploadProgress>().await?)
 }
 
 async fn upload_chunks(
@@ -148,7 +148,17 @@ async fn upload_chunks(
 
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(progress)) => {
+                let throughput_mib = progress.throughput_bytes_per_sec / (1 << 20) as f64;
+                eprintln!(
+                    "uploaded {}/{} | {:.1}% | {:.2} MiB/s | eta {:.1}s",
+                    progress.uploaded_chunks,
+                    progress.total_chunks,
+                    progress.percent_complete,
+                    throughput_mib,
+                    progress.eta_seconds
+                );
+            }
             Ok(Err(error)) => {
                 eprintln!("chunk upload failed: {error}");
             }
