@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/upload/status/{wark}", get(upload_status))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("listening on http://127.0.0.1:3000");
     axum::serve(listener, app).await?;
 
