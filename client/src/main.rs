@@ -8,6 +8,10 @@ use std::{
 };
 
 use memmap2::{Mmap, MmapOptions};
+mod metrics;
+use metrics::{
+    ClientChunkStats, FinalizeStats, HandshakeStats, MetadataStats, UploadMetrics,
+};
 use protocol::{
     ChunkUploadProgress, FinalizeUpload, UploadHandshake, UploadSessionResponse,
     compute_chunk_size, compute_wark, hash_chunk,
@@ -46,9 +50,11 @@ async fn main() -> Result<()> {
     upload_file(path).await
 }
 
-fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
+fn build_metadata(path: &Path, metrics: &UploadMetrics) -> Result<(UploadHandshake, String)> {
+    let file_open_started = Instant::now();
     let file = File::open(path)?;
     let filesize = file.metadata()?.len();
+    let file_open_elapsed = file_open_started.elapsed();
     let chunk_size = compute_chunk_size(filesize);
     if chunk_size == 0 {
         return Err(io::Error::other("compute_chunk_size returned 0").into());
@@ -58,6 +64,8 @@ fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no filename"))?
         .to_string_lossy()
         .into_owned();
+    let mut mmap_elapsed = Duration::ZERO;
+    let mut hash_elapsed = Duration::ZERO;
 
     let hashes = if filesize == 0 {
         Vec::new()
@@ -66,8 +74,10 @@ fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
             .map_err(|_| io::Error::other("chunk size too large for this platform"))?;
         let expected_len = usize::try_from(filesize)
             .map_err(|_| io::Error::other("file too large to map on this platform"))?;
+        let mmap_started = Instant::now();
         // SAFETY: the file stays open for the lifetime of the map, and we only read from it.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
+        mmap_elapsed = mmap_started.elapsed();
         if mmap.len() != expected_len {
             return Err(io::Error::other(format!(
                 "mapped file size changed during hashing: expected {}, got {}",
@@ -77,49 +87,23 @@ fn build_metadata(path: &Path) -> Result<(UploadHandshake, String)> {
             .into());
         }
         let hash_started = Instant::now();
-        let chunk_results: Vec<_> = mmap
-            .par_chunks(chunk_size)
-            .enumerate()
-            .map(|(index, chunk)| {
-                let started = Instant::now();
-                let hash = hash_chunk(chunk);
-                let elapsed = started.elapsed().as_secs_f64();
-                (index, chunk.len(), hash, elapsed)
-            })
-            .collect();
-
-        let total_chunks = chunk_results.len();
-        let wall_clock_hash_time = hash_started.elapsed().as_secs_f64();
-        for (index, chunk_len, _, elapsed) in &chunk_results {
-            let progress = ((*index + 1) as f64 / total_chunks as f64) * 100.0;
-            let throughput_mib = if *elapsed > 0.0 {
-                (*chunk_len as f64 / (1 << 20) as f64) / *elapsed
-            } else {
-                0.0
-            };
-            eprintln!(
-                "hashed {}/{} | {:.1}% | {:.2} MiB/s | {:.6}s",
-                index + 1,
-                total_chunks,
-                progress,
-                throughput_mib,
-                elapsed
-            );
-        }
-        eprintln!(
-            "hash total {}/{} | 100.0% | {:.6}s",
-            total_chunks,
-            total_chunks,
-            wall_clock_hash_time
-        );
-
-        chunk_results
-            .into_iter()
-            .map(|(_, _, hash, _)| hash)
-            .collect()
+        let hashes = mmap.par_chunks(chunk_size).map(hash_chunk).collect();
+        hash_elapsed = hash_started.elapsed();
+        hashes
     };
 
+    let wark_started = Instant::now();
     let wark = compute_wark(SALT, filesize, &hashes);
+    let wark_elapsed = wark_started.elapsed();
+    metrics.record_metadata(MetadataStats {
+        file_open: file_open_elapsed,
+        mmap: mmap_elapsed,
+        hash_wall: hash_elapsed,
+        wark: wark_elapsed,
+        filesize,
+        chunk_size,
+        chunk_count: u32::try_from(hashes.len()).unwrap_or(u32::MAX),
+    });
     let handshake = UploadHandshake {
         filename,
         filesize,
@@ -149,7 +133,9 @@ async fn handshake(
     client: &Client,
     handshake: &UploadHandshake,
     wark: &str,
+    metrics: &UploadMetrics,
 ) -> Result<UploadSessionResponse> {
+    let started = Instant::now();
     let response = client
         .post(endpoint("/upload/handshake"))
         .json(handshake)
@@ -166,6 +152,10 @@ async fn handshake(
         .into());
     }
 
+    metrics.record_handshake(HandshakeStats {
+        elapsed: started.elapsed(),
+        missing_chunks: session.missing_chunks.len(),
+    });
     Ok(session)
 }
 
@@ -175,7 +165,10 @@ async fn upload_chunk(
     wark: &str,
     mmap: &Mmap,
     index: u32,
+    metrics: &UploadMetrics,
 ) -> Result<ChunkUploadProgress> {
+    let total_started = Instant::now();
+    let inflight = metrics.inflight_guard();
     if upload_plan.chunk_size == 0 {
         return Err(io::Error::other(format!("chunk {}: chunk_size must be > 0", index)).into());
     }
@@ -189,6 +182,7 @@ async fn upload_chunk(
         );
     }
 
+    let prep_started = Instant::now();
     let offset = u64::from(index)
         .checked_mul(upload_plan.chunk_size)
         .ok_or_else(|| io::Error::other(format!("chunk {}: chunk offset overflow", index)))?;
@@ -201,28 +195,83 @@ async fn upload_chunk(
         .map_err(|_| io::Error::other(format!("chunk {}: chunk end too large", index)))?;
     let chunk = &mmap[start..end];
     let index_text = index.to_string();
+    let prep_elapsed = prep_started.elapsed();
+    let body_copy_started = Instant::now();
+    let body = chunk.to_vec();
+    let body_copy_elapsed = body_copy_started.elapsed();
 
+    let send_started = Instant::now();
     let response = client
         .post(endpoint("/upload/chunk"))
         .query(&[("wark", wark), ("index", index_text.as_str())])
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(chunk.to_vec())
+        .body(body)
         .send()
         .await
-        .map_err(|error| io::Error::other(format!("chunk {}: request failed: {}", index, error)))?
+        .map_err(|error| {
+            metrics.record_chunk(ClientChunkStats {
+                index,
+                chunk_size: chunk.len(),
+                inflight_at_start: inflight.inflight_at_start(),
+                prep: prep_elapsed,
+                body_copy: body_copy_elapsed,
+                send_wait: send_started.elapsed(),
+                response_decode: Duration::ZERO,
+                total: total_started.elapsed(),
+                success: false,
+            });
+            io::Error::other(format!("chunk {}: request failed: {}", index, error))
+        })?
         .error_for_status()
-        .map_err(|error| io::Error::other(format!("chunk {}: server error: {}", index, error)))?;
+        .map_err(|error| {
+            metrics.record_chunk(ClientChunkStats {
+                index,
+                chunk_size: chunk.len(),
+                inflight_at_start: inflight.inflight_at_start(),
+                prep: prep_elapsed,
+                body_copy: body_copy_elapsed,
+                send_wait: send_started.elapsed(),
+                response_decode: Duration::ZERO,
+                total: total_started.elapsed(),
+                success: false,
+            });
+            io::Error::other(format!("chunk {}: server error: {}", index, error))
+        })?;
+    let send_elapsed = send_started.elapsed();
 
+    let decode_started = Instant::now();
     let progress = response
         .json::<ChunkUploadProgress>()
         .await
         .map_err(|error| {
+            metrics.record_chunk(ClientChunkStats {
+                index,
+                chunk_size: chunk.len(),
+                inflight_at_start: inflight.inflight_at_start(),
+                prep: prep_elapsed,
+                body_copy: body_copy_elapsed,
+                send_wait: send_elapsed,
+                response_decode: decode_started.elapsed(),
+                total: total_started.elapsed(),
+                success: false,
+            });
             io::Error::other(format!(
                 "chunk {}: invalid progress response: {}",
                 index, error
             ))
         })?;
     if progress.wark != wark {
+        metrics.record_chunk(ClientChunkStats {
+            index,
+            chunk_size: chunk.len(),
+            inflight_at_start: inflight.inflight_at_start(),
+            prep: prep_elapsed,
+            body_copy: body_copy_elapsed,
+            send_wait: send_elapsed,
+            response_decode: decode_started.elapsed(),
+            total: total_started.elapsed(),
+            success: false,
+        });
         return Err(io::Error::other(format!(
             "chunk {}: progress response wark mismatch: expected {}, got {}",
             index, wark, progress.wark
@@ -230,6 +279,17 @@ async fn upload_chunk(
         .into());
     }
     if progress.index != index {
+        metrics.record_chunk(ClientChunkStats {
+            index,
+            chunk_size: chunk.len(),
+            inflight_at_start: inflight.inflight_at_start(),
+            prep: prep_elapsed,
+            body_copy: body_copy_elapsed,
+            send_wait: send_elapsed,
+            response_decode: decode_started.elapsed(),
+            total: total_started.elapsed(),
+            success: false,
+        });
         return Err(io::Error::other(format!(
             "chunk {}: progress response index mismatch: got {}",
             index, progress.index
@@ -237,6 +297,17 @@ async fn upload_chunk(
         .into());
     }
 
+    metrics.record_chunk(ClientChunkStats {
+        index,
+        chunk_size: chunk.len(),
+        inflight_at_start: inflight.inflight_at_start(),
+        prep: prep_elapsed,
+        body_copy: body_copy_elapsed,
+        send_wait: send_elapsed,
+        response_decode: decode_started.elapsed(),
+        total: total_started.elapsed(),
+        success: true,
+    });
     Ok(progress)
 }
 
@@ -246,6 +317,7 @@ async fn upload_chunks(
     wark: &str,
     mmap: Arc<Mmap>,
     missing_chunks: Vec<u32>,
+    metrics: &UploadMetrics,
 ) -> Result<()> {
     if missing_chunks.is_empty() {
         return Ok(());
@@ -265,9 +337,10 @@ async fn upload_chunks(
             let upload_plan = Arc::clone(&upload_plan);
             let wark = wark.to_owned();
             let mmap = Arc::clone(&mmap);
+            let metrics = metrics.clone();
 
             tasks.spawn(async move {
-                let result = upload_chunk(&client, &upload_plan, &wark, &mmap, index).await;
+                let result = upload_chunk(&client, &upload_plan, &wark, &mmap, index, &metrics).await;
                 (index, result)
             });
         }
@@ -282,25 +355,14 @@ async fn upload_chunks(
             .ok_or_else(|| io::Error::other("upload task set ended unexpectedly"))?;
         match result {
             Ok((index, Ok(progress))) => {
-                let throughput_mib = progress.throughput_bytes_per_sec / (1 << 20) as f64;
-                eprintln!(
-                    "uploaded {}/{} | {:.1}% | {:.2} MiB/s | eta {:.1}s",
-                    progress.uploaded_chunks,
-                    progress.total_chunks,
-                    progress.percent_complete,
-                    throughput_mib,
-                    progress.eta_seconds
-                );
-                let _ = index;
+                let _ = (index, progress);
             }
             Ok((index, Err(error))) => {
-                eprintln!("chunk upload failed for chunk {}: {}", index, error);
                 if first_error.is_none() {
                     first_error = Some(format!("chunk {} failed: {}", index, error));
                 }
             }
             Err(error) => {
-                eprintln!("chunk upload task failed: {error}");
                 if first_error.is_none() {
                     first_error = Some(format!("chunk upload task failed: {}", error));
                 }
@@ -341,13 +403,15 @@ async fn finalize_upload(client: &Client, wark: &str) -> Result<UploadSessionRes
 }
 
 async fn upload_file(path: PathBuf) -> Result<()> {
-    let (handshake_request, wark) = build_metadata(&path)?;
+    let upload_started = Instant::now();
+    let metrics = UploadMetrics::new();
+    let (handshake_request, wark) = build_metadata(&path, &metrics)?;
     let upload_plan = Arc::new(build_upload_plan(&handshake_request)?);
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()?;
-    let mut missing_chunks = handshake(&client, &handshake_request, &wark)
+    let mut missing_chunks = handshake(&client, &handshake_request, &wark, &metrics)
         .await?
         .missing_chunks;
     let mut previous_missing_count = usize::MAX;
@@ -381,6 +445,7 @@ async fn upload_file(path: PathBuf) -> Result<()> {
                 &wark,
                 Arc::clone(mmap),
                 missing_chunks,
+                &metrics,
             )
             .await
             .err()
@@ -388,14 +453,18 @@ async fn upload_file(path: PathBuf) -> Result<()> {
             None
         };
 
+        let finalize_started = Instant::now();
         let session = finalize_upload(&client, &wark).await?;
+        metrics.record_finalize(FinalizeStats {
+            elapsed: finalize_started.elapsed(),
+            missing_chunks: session.missing_chunks.len(),
+            completed: session.missing_chunks.is_empty(),
+        });
         if session.missing_chunks.is_empty() {
             if let Some(error) = upload_error {
-                eprintln!(
-                    "some chunk uploads failed during the last pass but finalize completed: {}",
-                    error
-                );
+                eprintln!("upload completed after a partial failure in the last pass: {error}");
             }
+            metrics.record_upload_complete(upload_started.elapsed(), &wark);
             println!("upload complete: {wark}");
             return Ok(());
         }
@@ -415,14 +484,7 @@ async fn upload_file(path: PathBuf) -> Result<()> {
             return Err(io::Error::other(detail).into());
         }
 
-        if let Some(error) = upload_error {
-            eprintln!("upload pass failed but server still made progress: {}", error);
-        }
-
-        eprintln!(
-            "finalize reported {} missing chunks, retrying because progress was made",
-            session.missing_chunks.len(),
-        );
+        metrics.record_retry_pass();
         previous_missing_count = session.missing_chunks.len();
         missing_chunks = session.missing_chunks;
     }
