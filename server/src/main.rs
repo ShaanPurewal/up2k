@@ -9,8 +9,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    body::to_bytes,
+    extract::{Query, Request, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -53,6 +53,11 @@ struct ChunkQuery {
     index: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct StatusQuery {
+    wark: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     fs::create_dir_all(STORAGE_DIR)?;
@@ -60,12 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(Mutex::new(ServerState::default()));
     let app = Router::new()
         .route("/upload/handshake", post(upload_handshake))
-        .route(
-            "/upload/chunk",
-            post(upload_chunk).layer(DefaultBodyLimit::disable()),
-        )
+        .route("/upload/chunk", post(upload_chunk))
         .route("/upload/finalize", post(finalize_upload))
-        .route("/upload/status/{wark}", get(upload_status))
+        .route("/upload/status", get(upload_status))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
@@ -95,6 +97,16 @@ fn missing_chunks(received: &BitVec) -> Vec<u32> {
         .enumerate()
         .filter_map(|(index, done)| (!done).then_some(index as u32))
         .collect()
+}
+
+fn wark_file_name(wark: &str) -> String {
+    let mut file_name = String::with_capacity((wark.len() * 2) + ".upload".len());
+    for byte in wark.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut file_name, "{byte:02x}");
+    }
+    file_name.push_str(".upload");
+    file_name
 }
 
 fn chunk_progress(session: &UploadSession, index: u32) -> ChunkUploadProgress {
@@ -168,11 +180,7 @@ async fn upload_handshake(
         }
     }
 
-    let safe_wark: String = wark
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    let file_path = PathBuf::from(STORAGE_DIR).join(format!("{safe_wark}.upload"));
+    let file_path = PathBuf::from(STORAGE_DIR).join(wark_file_name(&wark));
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -220,7 +228,7 @@ async fn upload_handshake(
 async fn upload_chunk(
     State(state): State<SharedState>,
     Query(query): Query<ChunkQuery>,
-    body: Bytes,
+    request: Request,
 ) -> HandlerResult<Json<ChunkUploadProgress>> {
     let (file_path, chunk_size, filesize, expected_hash) = {
         let state = state.lock().map_err(|_| {
@@ -253,10 +261,20 @@ async fn upload_chunk(
 
     let offset = chunk_offset(query.index, chunk_size);
     let expected_size = filesize.saturating_sub(offset).min(chunk_size);
-    if body.len() as u64 > expected_size {
+    let body_limit = usize::try_from(expected_size)
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large".to_owned()))?;
+    let body = to_bytes(request.into_body(), body_limit)
+        .await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "chunk larger than expected".to_owned()))?;
+
+    if body.len() as u64 != expected_size {
         return Err((
             StatusCode::BAD_REQUEST,
-            "chunk larger than expected".to_owned(),
+            format!(
+                "chunk size mismatch: expected {}, got {}",
+                expected_size,
+                body.len()
+            ),
         ));
     }
 
@@ -264,6 +282,7 @@ async fn upload_chunk(
         return Err((StatusCode::BAD_REQUEST, "chunk hash mismatch".to_owned()));
     }
 
+    let uploaded_len = body.len() as u64;
     let write_body = body;
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let mut file = OpenOptions::new().write(true).open(&file_path)?;
@@ -288,7 +307,7 @@ async fn upload_chunk(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown wark".to_owned()))?;
     if !session.received[query.index as usize] {
         session.received.set(query.index as usize, true);
-        session.uploaded_bytes = session.uploaded_bytes.saturating_add(expected_size);
+        session.uploaded_bytes = session.uploaded_bytes.saturating_add(uploaded_len);
         session.uploaded_chunks = session.uploaded_chunks.saturating_add(1);
     }
 
@@ -318,7 +337,7 @@ async fn finalize_upload(
 
 async fn upload_status(
     State(state): State<SharedState>,
-    Path(wark): Path<String>,
+    Query(query): Query<StatusQuery>,
 ) -> HandlerResult<Json<UploadSessionResponse>> {
     let state = state.lock().map_err(|_| {
         (
@@ -328,7 +347,7 @@ async fn upload_status(
     })?;
     let session = state
         .sessions
-        .get(&wark)
+        .get(&query.wark)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown wark".to_owned()))?;
 
     Ok(Json(UploadSessionResponse {
