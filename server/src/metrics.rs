@@ -1,8 +1,8 @@
 use std::array::from_fn;
 use std::env;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -10,23 +10,8 @@ const DETAIL_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_TRACE_EVERY_N: u64 = 64;
 const HISTOGRAM_BOUNDS_US: [u64; 17] = [
-    50,
-    100,
-    250,
-    500,
-    1_000,
-    2_000,
-    5_000,
-    10_000,
-    20_000,
-    50_000,
-    100_000,
-    200_000,
-    500_000,
-    1_000_000,
-    2_000_000,
-    5_000_000,
-    10_000_000,
+    50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
+    1_000_000, 2_000_000, 5_000_000, 10_000_000,
 ];
 const HISTOGRAM_BUCKETS: usize = HISTOGRAM_BOUNDS_US.len() + 1;
 
@@ -70,7 +55,9 @@ pub struct BlockingWriteGuard {
 
 impl Drop for BlockingWriteGuard {
     fn drop(&mut self) {
-        self.inner.current_blocking_writes.fetch_sub(1, Ordering::Relaxed);
+        self.inner
+            .current_blocking_writes
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -235,7 +222,9 @@ impl ServerMetrics {
             if sequential {
                 self.inner.sequential_window.fetch_add(1, Ordering::Relaxed);
             } else {
-                self.inner.out_of_order_window.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .out_of_order_window
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -248,7 +237,7 @@ impl ServerMetrics {
         }
 
         let sequence = self.inner.trace_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        if sequence % self.inner.trace_every_n != 0 {
+        if !sequence.is_multiple_of(self.inner.trace_every_n) {
             return;
         }
 
@@ -292,9 +281,11 @@ impl ServerMetrics {
         }
 
         let inner = Arc::clone(&self.inner);
-        thread::spawn(move || loop {
-            thread::sleep(inner.interval);
-            inner.print_summary();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(inner.interval);
+                inner.print_summary();
+            }
         });
     }
 }

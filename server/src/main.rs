@@ -268,7 +268,15 @@ async fn upload_chunk(
     let mut write_timings = WriteTimings::default();
 
     let first_lock_wait_started = Instant::now();
-    let (file_path, chunk_size, filesize, expected_hash, duplicate_progress, first_lock_wait, first_lock_hold) = {
+    let (
+        file_path,
+        chunk_size,
+        filesize,
+        expected_hash,
+        duplicate_progress,
+        first_lock_wait,
+        first_lock_hold,
+    ) = {
         let state = app.state.lock().map_err(|_| state_lock_error())?;
         let first_lock_wait = first_lock_wait_started.elapsed();
         let hold_started = Instant::now();
@@ -289,7 +297,8 @@ async fn upload_chunk(
             .copied()
             .unwrap_or(false)
             .then(|| chunk_progress(session, query.index));
-        let result = (
+
+        (
             session.file_path.clone(),
             session.chunk_size,
             session.filesize,
@@ -297,8 +306,7 @@ async fn upload_chunk(
             duplicate_progress,
             first_lock_wait,
             hold_started.elapsed(),
-        );
-        result
+        )
     };
     lock_wait_total += first_lock_wait;
     lock_hold_total += first_lock_hold;
@@ -328,29 +336,28 @@ async fn upload_chunk(
         return Ok(Json(progress));
     }
 
-    let body_limit = usize::try_from(expected_size)
-        .map_err(|_| {
-            app.metrics.record_chunk(ChunkRequestStats {
-                index: query.index,
-                chunk_size: expected_size,
-                lock_wait: lock_wait_total,
-                lock_hold: lock_hold_total,
-                body_read: body_read_elapsed,
-                hash_verify: hash_verify_elapsed,
-                queue_delay: write_timings.queue_delay,
-                open: write_timings.open,
-                seek: write_timings.seek,
-                write: write_timings.write,
-                flush: write_timings.flush,
-                storage_total: write_timings.total,
-                handler_total: handler_started.elapsed(),
-                duplicate: false,
-                sequential: None,
-                stored: false,
-                error: true,
-            });
-            (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large".to_owned())
-        })?;
+    let body_limit = usize::try_from(expected_size).map_err(|_| {
+        app.metrics.record_chunk(ChunkRequestStats {
+            index: query.index,
+            chunk_size: expected_size,
+            lock_wait: lock_wait_total,
+            lock_hold: lock_hold_total,
+            body_read: body_read_elapsed,
+            hash_verify: hash_verify_elapsed,
+            queue_delay: write_timings.queue_delay,
+            open: write_timings.open,
+            seek: write_timings.seek,
+            write: write_timings.write,
+            flush: write_timings.flush,
+            storage_total: write_timings.total,
+            handler_total: handler_started.elapsed(),
+            duplicate: false,
+            sequential: None,
+            stored: false,
+            error: true,
+        });
+        (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large".to_owned())
+    })?;
     let body_read_started = Instant::now();
     let body = to_bytes(request.into_body(), body_limit)
         .await
@@ -375,7 +382,10 @@ async fn upload_chunk(
                 stored: false,
                 error: true,
             });
-            (StatusCode::PAYLOAD_TOO_LARGE, "chunk larger than expected".to_owned())
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "chunk larger than expected".to_owned(),
+            )
         })?;
     body_read_elapsed = body_read_started.elapsed();
 

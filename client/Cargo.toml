@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytes = "1.11.1"
 memmap2 = "0.9.10"
 protocol = { path = "../protocol" }
 rayon = "1.11.0"

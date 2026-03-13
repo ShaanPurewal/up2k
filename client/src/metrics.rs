@@ -1,8 +1,8 @@
 use std::array::from_fn;
 use std::env;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -10,23 +10,8 @@ const DETAIL_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_TRACE_EVERY_N: u64 = 64;
 const HISTOGRAM_BOUNDS_US: [u64; 17] = [
-    50,
-    100,
-    250,
-    500,
-    1_000,
-    2_000,
-    5_000,
-    10_000,
-    20_000,
-    50_000,
-    100_000,
-    200_000,
-    500_000,
-    1_000_000,
-    2_000_000,
-    5_000_000,
-    10_000_000,
+    50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
+    1_000_000, 2_000_000, 5_000_000, 10_000_000,
 ];
 const HISTOGRAM_BUCKETS: usize = HISTOGRAM_BOUNDS_US.len() + 1;
 
@@ -62,8 +47,7 @@ impl InstrumentationMode {
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataStats {
     pub file_open: Duration,
-    pub mmap: Duration,
-    pub hash_wall: Duration,
+    pub hash: Duration,
     pub wark: Duration,
     pub filesize: u64,
     pub chunk_size: u64,
@@ -195,14 +179,13 @@ impl UploadMetrics {
             stats.chunk_count
         );
         eprintln!(
-            "  metadata: open {}, mmap {}, hash {}, wark {}",
+            "  metadata: open {}, hash {}, wark {}",
             fmt_duration(stats.file_open),
-            fmt_duration(stats.mmap),
-            fmt_duration(stats.hash_wall),
+            fmt_duration(stats.hash),
             fmt_duration(stats.wark)
         );
-        if stats.hash_wall.as_micros() > 0 && stats.filesize > 0 {
-            let hash_rate = stats.filesize as f64 / stats.hash_wall.as_secs_f64();
+        if stats.hash.as_micros() > 0 && stats.filesize > 0 {
+            let hash_rate = stats.filesize as f64 / stats.hash.as_secs_f64();
             eprintln!("  hash rate: {}/s", fmt_bytes_f64(hash_rate));
         }
     }
@@ -283,7 +266,7 @@ impl UploadMetrics {
         }
 
         let sequence = self.inner.trace_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        if sequence % self.inner.trace_every_n != 0 {
+        if !sequence.is_multiple_of(self.inner.trace_every_n) {
             return;
         }
 
@@ -321,9 +304,11 @@ impl UploadMetrics {
         }
 
         let inner = Arc::clone(&self.inner);
-        thread::spawn(move || loop {
-            thread::sleep(inner.interval);
-            inner.print_summary();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(inner.interval);
+                inner.print_summary();
+            }
         });
     }
 }
@@ -368,10 +353,7 @@ impl Inner {
         let send = self.chunk_send_wait.snapshot_and_reset();
         let decode = self.chunk_decode.snapshot_and_reset();
 
-        eprintln!(
-            "[client] {:.1}s window",
-            self.interval.as_secs_f64()
-        );
+        eprintln!("[client] {:.1}s window", self.interval.as_secs_f64());
         eprintln!(
             "  throughput: {} chunks, {}, {}/s, inflight {}/{}, failures {}, retries {}, dropped traces {}",
             chunks,
